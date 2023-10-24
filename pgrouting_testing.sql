@@ -3,13 +3,13 @@ CREATE EXTENSION postgis;
 CREATE EXTENSION pgrouting;
 
 --import data from shapefile or osm
---changing srid
+--changnig srid
 ALTER TABLE osm_roads
 ALTER COLUMN geom 
 TYPE Geometry(linestring, 2180) 
 USING ST_Transform(geom, 2180);
 
---creating schema for separate data
+--createting schema for separate data
 CREATE SCHEMA route;
 
 --creating car drivable net
@@ -33,15 +33,15 @@ SELECT pgr_createTopology('route.roads', 0.01,'geom','gid');
 SELECT pgr_analyzeGraph('route.roads', 0.01,'geom','gid');
 
 
---network correction
+--network corection
 SELECT pgr_nodeNetwork('route.roads', 0.01, 'gid', 'geom');
 
 
 ALTER TABLE route.roads_noded 
 ADD COLUMN cost_len double precision,
-ADD COLUMN rcost_len double precision;
+ADD COLUMN rcost_len double precision,
 add column cost_time double precision,
-add column rcost_time double precision;
+add column rcost_time double precision,
 ADD COLUMN oneway character varying(1),
 ADD COLUMN maxspeed smallint;
 
@@ -194,26 +194,112 @@ from pol group by t order by t desc;
 
 
 --Resolving TRSP Problem with restricion buffer
-create or replace view route.restrictions as
+create or replace view route.restrictions_250 as
 with pol as (
-select st_buffer(st_setsrid(st_point(359975,506557),2180),2000)as geom
+select st_buffer(st_setsrid(st_point(359975,506557),2180),500)as geom
 )
 select id as path, cost_len as cost
 from route.roads_noded r inner join pol p 
-on st_intersects(p.geom,r.geom)
+on st_intersects(p.geom,r.geom);
+
+--testing route with TRSP
+SELECT seq, node, edge,cost,agg_cost,geom 
+FROM pgr_dijkstra(
+	$$ SELECT id, source, target, cost_len as cost, rcost_len as reverse_cost 
+	FROM route.roads_noded$$,
+ 24984, 47618,true)AS di
+join route.roads_noded pt ON di.edge=pt.id;
+
 SELECT * FROM pgr_trsp(
   $$ SELECT id, source, target, cost_len as cost, rcost_len as reverse_cost 
 	FROM route.roads_noded$$,
-  $$ select array[path] as path, cost from route.restrictions $$,
-  24984, 47618,
-  true)AS di
+  $$ select array[path] as path, cost from route.restrictions_250 $$,
+  24984, 47618,true)AS di
 join route.roads_noded pt ON di.edge=pt.id;
 
 
+--working w denser network
+--table creating with edges up to 50m
+CREATE TABLE route.roads_50 AS
+SELECT row_number() OVER (ORDER BY gid asc)AS gid,gid AS old_id, oneway, maxspeed, ST_LineSubstring(geom, 50.00*n/length,
+  CASE
+	WHEN 50.00*(n+1) < length THEN 50.00*(n+1)/length
+	ELSE 1
+  END) ::geometry(linestring,2180) As geom 
+FROM
+  (SELECT roads.gid, oneway, maxspeed,
+  ST_LineMerge(roads.geom) AS geom, --st_linemerge in the case connected multilines
+  ST_Length(roads.geom) As length
+  FROM route.roads
+  ) AS t
+CROSS JOIN generate_series(0,10000) AS n
+WHERE n*50.00/length < 1;
+--Query returned successfully in 3 min 30 secs.
+
+--network corection
+SELECT pgr_nodeNetwork('route.roads_50', 0.01, 'gid', 'geom');
+
+ALTER TABLE route.roads_50_noded 
+ADD COLUMN cost_len double precision,
+ADD COLUMN rcost_len double precision,
+add column cost_time double precision,
+add column rcost_time double precision,
+ADD COLUMN one_way character varying(1),
+ADD COLUMN maxspeed smallint;
+
+UPDATE route.roads_50_noded SET cost_len = ST_Length(geom);
+UPDATE route.roads_50_noded SET rcost_len = ST_Length(geom);
+
+SELECT pgr_createTopology('route.roads_50_noded', 0.01,'geom','id');
+SELECT pgr_analyzeGraph('route.roads_50_noded', 0.01,'geom','id');
+
+update route.roads_50_noded n
+set oneway = r.oneway from route.roads_50 r where n.old_id =gid;
+
+--setting direction restricion
+update route.roads_50_noded 
+set one_way = 0 --both directional
+where oneway='B';
+
+update route.roads_50_noded 
+set one_way = 1 --one directional
+where oneway='F';
+
+update route.roads_50_noded 
+set one_way = -1 --rev one directional
+where oneway='T';
+
+update route.roads_50_noded n
+set maxspeed = r.maxspeed from route.roads_50 r where n.old_id =gid;
+
+select distinct maxspeed from route.roads_50_noded;
+
+update route.roads_50_noded 
+set maxspeed =40 where maxspeed=0;
+
+update route.roads_50_noded 
+set cost_time =cost_len/1000/maxspeed*60;
+
+--wrapper function for driving distance with time - alphashape
+CREATE OR REPLACE FUNCTION route.alphaShape_time_50(x double precision, y double precision, dim integer)
+returns table (geom geometry) AS
+$$
+WITH dd AS (
+SELECT *
+FROM pgr_drivingDistance(
+'SELECT id, source, target,cost_time::double precision AS cost
+FROM route.roads_50_noded',
+(SELECT id::integer FROM route.roads_50_noded_vertices_pgr
+ORDER BY the_geom <-> ST_Transform(ST_GeometryFromText('POINT('||x||' '||y||')',4326),2180) LIMIT 1),
+dim, false)
+)
+SELECT  ST_ConcaveHull(st_collect(the_geom),0.2) AS geom
+FROM route.roads_50_noded_vertices_pgr net
+INNER JOIN dd ON net.id=dd.node;
+$$
+LANGUAGE 'sql';
 
 
-
-
-
-
-
+SELECT t, route.alphaShape_time( 16.9,52.4,t)geom
+FROM 
+generate_series(2,10,2)t ORDER BY t desc ;
